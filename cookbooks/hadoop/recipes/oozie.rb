@@ -1,131 +1,115 @@
 #
-# Cookbook Name:: hadoop-cdh4
+# Cookbook Name:: hadoop
 # Recipe:: oozie
 #
-# Author: Murali Raju <murali.raju@appliv.com>
-#
-# Copyright 2013, Velankani Information Systems, Inc eng@velankani.net
+# Copyright (C) 2013-2014 Continuuity, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
-# cookbooksributed under the License is cookbooksributed on an "AS IS" BASIS,
+# distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
-include_recipe "database::mysql"
+include_recipe 'hadoop::repo'
+include_recipe 'hadoop::oozie_client'
 
-oozie_lib_path = node[:cloudera_cdh][:oozie][:lib]
-mysql_connector_java = node[:cloudera_cdh][:mysql][:jdbc_connector]
+package 'oozie' do
+  action :install
+end
 
-%w'unzip
-oozie
-oozie-client'.each do | pack |
-  package pack do
-    action :install
-    options "--force-yes"
+oozie_conf_dir = "/etc/oozie/#{node['oozie']['conf_dir']}"
+oozie_data_dir = '/var/lib/oozie'
+java_share_dir = '/usr/share/java'
+
+case node['platform_family']
+when 'debian'
+  pkgs = %w(
+    libmysql-java
+    libpostgresql-jdbc-java
+  )
+  jars = %w(
+    mysql-connector-java
+    postgresql-jdbc4
+  )
+when 'rhel'
+  case node['platform_version'].to_i
+  when 6
+    pkgs = %w(
+      mysql-connector-java
+      postgresql-jdbc
+    )
+    jars = pkgs
+  else
+    Chef::Log.warn('You must download and install JDBC connectors')
+    pkgs = nil
   end
 end
 
+pkgs.each do |pkg|
+  package pkg do
+    action :install
+  end
+end
 
-# create a mysql database
-mysql_database "#{node['cloudera_cdh']['mysql']['ooziedb']}" do
-  connection ({:host => "localhost", :username => 'root', :password => node['mysql']['server_root_password']})
+jars.each do |jar|
+  link "#{oozie_data_dir}/#{jar}.jar" do
+    to "#{java_share_dir}/#{jar}.jar"
+  end
+end
+
+extjs = 'ext-2.2.zip'
+remote_file "#{Chef::Config[:file_cache_path]}/#{extjs}" do
+  source "http://extjs.com/deploy/#{extjs}"
+  mode '0644'
+  action :create_if_missing
+end
+
+package 'unzip'
+
+script 'extract extjs into Oozie data directory' do
+  interpreter 'bash'
+  user 'root'
+  action :nothing
+  code "unzip -o -d #{oozie_data_dir} #{Chef::Config[:file_cache_path]}/#{extjs}"
+  subscribes :run, "remote_file[#{Chef::Config[:file_cache_path]}/#{extjs}", :immediately
+end
+
+directory oozie_conf_dir do
+  mode '0755'
+  owner 'root'
+  group 'root'
   action :create
+  recursive true
 end
 
+if node['oozie'].key? 'oozie_site'
+  my_vars = { :options => node['oozie']['oozie_site'] }
 
-#Create the ooziedb_user
-
-mysql_connection_info = {:host => "localhost",
-                         :username => 'root',
-                         :password => node['mysql']['server_root_password']}
-
-
-# Create a the oozie_db user but grant no privileges
-mysql_database_user "#{node['cloudera_cdh']['mysql']['ooziedb_user_name']}" do
-  connection mysql_connection_info
-  password "#{node['mysql']['ooziedb_user_password']}"
-  action :create
+  template "#{oozie_conf_dir}/oozie-site.xml" do
+    source 'generic-site.xml.erb'
+    mode '0644'
+    owner 'oozie'
+    group 'oozie'
+    action :create
+    variables my_vars
+  end
 end
 
-# Grant privileges to oozie_db
-mysql_database_user "#{node['cloudera_cdh']['mysql']['ooziedb_user_name']}" do
-  connection mysql_connection_info
-  password "#{node['cloudera_cdh']['mysql']['ooziedb_user_password']}"
-  database_name "#{node['cloudera_cdh']['mysql']['ooziedb']}"
-  privileges [:all]
-  action :grant
+service 'oozie' do
+  status_command 'service oozie status'
+  supports [:restart => true, :reload => false, :status => true]
+  action :nothing
 end
 
-remote_file "#{oozie_lib_path}/mysql-connector-java-5.1.9.jar" do
-  source "#{mysql_connector_java}"
-  not_if { File.exists?("#{oozie_lib_path}/mysql-connector-java-5.1.9.jar") }
-end
-
-remote_file "/tmp/ext-2.2.zip" do
-  source "http://archive.cloudera.com/gplextras/misc/ext-2.2.zip"
-  not_if { File.exists?("/tmp/ext-2.2.zip") }
-end
-
-script "Setting up environment" do
-  interpreter "bash"
-  user "root"
-  code <<-EOH
-  chmod -R 777 /var/lib/oozie
-  chown -R oozie:oozie /var/lib/oozie
-  sudo -u hdfs hadoop fs -mkdir /user/oozie
-  sudo -u hdfs hadoop fs -chown oozie:oozie /user/oozie
-  cp /tmp/ext-2.2.zip  /var/lib/oozie
-  cd /var/lib/oozie
-  unzip ext-2.2.zip
-  EOH
-  not_if { "hadoop fs -ls /user | egrep oozie" }
-end
-
-script "Setting up Oozie sharedlib" do
-  interpreter "bash"
-  user "root"
-  code <<-EOH
-  cd /tmp
-  tar -xzvf /usr/lib/oozie/oozie-sharelib.tar.gz 
-  sudo -u oozie hadoop fs -put share /user/oozie/share
-  EOH
-  not_if { "hadoop fs -ls /user/oozie | egrep share" }
-end
-
-
-#TODO
-# script "Create DB schema" do
-#   interpreter "bash"
-#   user "root"
-#   code <<-EOH
-#   sudo -u oozie /usr/lib/oozie/bin/ooziedb.sh create -run
-#   EOH
-#   not_if("/usr/bin/mysql -uroot -p #{node['mysql']['server_root_password']} -e'show databases' 
-#   	| grep #{node['cloudera_cdh']['mysql']['ooziedb']}")
-# end
-
-script "Creating and copying workflows" do
-  interpreter "bash"
-  user "root"
-  code <<-EOH
-  cd /root
-  mkdir -p oozie-workflows/lib
-  cp /usr/lib/hive/lib/hive-serdes-1.0-SNAPSHOT.jar oozie-workflows/lib
-  cp /var/lib/oozie//var/lib/oozie/mysql-connector-*.jar oozie-workflows/lib
-  cp /etc/hive/conf/hive-site.xml oozie-workflows
-  chown root:root oozie-workflows/hive-site.xml
-  hadoop fs -put oozie-workflows /user/root/oozie-workflows
-  EOH
-  not_if { "hadoop fs -ls /user/root | egrep oozie-workflows" }
-end
-
-service "oozie" do
-  action [ :enable, :restart ]
+# Update alternatives to point to our configuration
+execute 'update oozie-conf alternatives' do
+  command "update-alternatives --install /etc/oozie/conf oozie-conf /etc/oozie/#{node['oozie']['conf_dir']} 50"
+  not_if "update-alternatives --display oozie-conf | grep best | awk '{print $5}' | grep /etc/oozie/#{node['oozie']['conf_dir']}"
 end
